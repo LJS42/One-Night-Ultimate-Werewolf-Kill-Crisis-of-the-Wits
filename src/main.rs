@@ -8,6 +8,7 @@ use rand::{thread_rng, Rng};
 use rand::seq::SliceRandom;
 use tokio::join;
 use tokio::io::BufReader;
+use rand::seq::IteratorRandom;
 
 #[derive(Debug, Clone)]
 struct Player {
@@ -16,7 +17,7 @@ struct Player {
     num: usize,
 }
 #[derive(Debug)]
-struct GameState {
+pub struct GameState {
     players: HashMap<usize, Player>,
     name_to_id: HashMap<String, usize>,
     player_channels: HashMap<usize, mpsc::Sender<String>>,
@@ -26,6 +27,8 @@ struct GameState {
     used_ids: HashSet<usize>,
     pending_responses: HashMap<usize, oneshot::Sender<String>>,
     available_ids: Vec<usize>,
+    robot: Option<Player>,
+    robot_helper_id: Option<usize>,
 }
 
 
@@ -52,6 +55,8 @@ async fn main() {
         used_ids: HashSet::new(),
         pending_responses: HashMap::new(),
         available_ids: ids,
+        robot: None,                
+        robot_helper_id: None, 
     }));
 
     // 创建广播通道
@@ -120,6 +125,7 @@ async fn handle_client(stream: TcpStream, game_state: Arc<Mutex<GameState>>, tx:
 
     if should_start_game {
         setup_center_cards(game_state.clone()).await;
+        setup_robot(game_state.clone()).await;
         start_night_phase(game_state.clone(), tx.clone()).await;
     }
 
@@ -154,10 +160,38 @@ async fn handle_client(stream: TcpStream, game_state: Arc<Mutex<GameState>>, tx:
     }
 }
 
-async fn setup_robot(game_state: Arc<Mutex<GameState>>){
+async fn setup_robot(game_state: Arc<Mutex<GameState>>) {
     let mut state = game_state.lock().await;
-    state.robot = state.available_roles.pop().unwrap();
+
+    if let (Some(role), Some(id)) = (state.available_roles.pop(), state.available_ids.pop()) {
+        let robot = Player {
+            name: "Computer".to_string(),
+            role,
+            num: id,
+        };
+        state.robot = Some(robot);
+    } else {
+        println!("无法为机器人分配角色或ID");
+        return;
+    }
+
+    let robot_id = state.robot.as_ref().unwrap().num;
+
+    let candidates: Vec<usize> = state
+        .name_to_id
+        .values()
+        .filter(|&&id| id != robot_id)
+        .copied()
+        .collect();
+
+    if let Some(&helper_id) = candidates.iter().choose(&mut thread_rng()) {
+        state.robot_helper_id = Some(helper_id);
+        println!("Robot helper ID is: {}", helper_id);
+    } else {
+        println!("没有合适的玩家作为机器人助手");
+    }
 }
+
 
 async fn setup_center_cards(game_state: Arc<Mutex<GameState>>) {
     let mut state = game_state.lock().await;
@@ -238,8 +272,7 @@ async fn start_night_phase(game_state: Arc<Mutex<GameState>>, tx: broadcast::Sen
         handle_insomniac(game_state.clone())
     );
 
-    handle_robot(game_state.clone());
-    handle_robothelper(game_state.clone()).await;
+    handle_robot(game_state.clone()).await;
 
     {
         let mut state = game_state.lock().await;
@@ -656,5 +689,152 @@ async fn handle_insomniac(game_state: Arc<Mutex<GameState>>) {
             insomniac.num, 
             &format!("你是失眠者，你的最终身份是：{}", role)
         ).await;
+    }
+}
+
+
+pub async fn handle_robot(game_state: Arc<Mutex<GameState>>) {
+    let robot_info;
+    let helper_id;
+
+    {
+        let state = game_state.lock().await;
+        robot_info = state.robot.clone();
+        helper_id = state.robot_helper_id;
+    }
+
+    if let (Some(robot), Some(helper_id)) = (robot_info, helper_id) {
+        let robot_msg;
+
+        match robot.role.as_str() {
+            "酒鬼" => {
+                let (idx, old_robot_role, new_robot_role) = {
+                    let state = game_state.lock().await;
+                    if state.center_cards.is_empty() {
+                        return;
+                    }
+                    let mut rng = thread_rng();
+                    let idx = rng.gen_range(0..state.center_cards.len());
+                    let old_robot_role = state.robot.as_ref().unwrap().role.clone();
+                    let new_robot_role = state.center_cards[idx].clone();
+                    (idx, old_robot_role, new_robot_role)
+                };
+
+                {
+                    let mut state = game_state.lock().await;
+                    state.robot.as_mut().unwrap().role = new_robot_role.clone();
+                    state.center_cards[idx] = old_robot_role.clone();
+                }
+
+                robot_msg = format!(
+                    "机器人是酒鬼，与中心牌 {} 交换，现在身份是：{}",
+                    idx, new_robot_role
+                );
+            }
+            "捣蛋鬼" => {
+                let (id1, id2) = {
+                    let state = game_state.lock().await;
+                    let mut candidates: Vec<usize> = state.players
+                        .keys()
+                        .filter(|&&id| id != robot.num)
+                        .copied()
+                        .collect();
+                    let mut rng = thread_rng();
+                    candidates.shuffle(&mut rng);
+                    (candidates[0], candidates[1])
+                };
+
+                let mut state = game_state.lock().await;
+                let role1 = state.players.get(&id1).unwrap().role.clone();
+                let role2 = state.players.get(&id2).unwrap().role.clone();
+
+                state.players.get_mut(&id1).unwrap().role = role2.clone();
+                state.players.get_mut(&id2).unwrap().role = role1.clone();
+
+                robot_msg = format!(
+                    "机器人是捣蛋鬼，交换了玩家 {} 和 {} 的身份", id1, id2
+                );
+            }
+            "预言家" => {
+                let check_center = thread_rng().gen_bool(0.5);
+
+                if check_center {
+                    let cards = {
+                        let state = game_state.lock().await;
+                        let mut rng = thread_rng();
+                        let mut indices: Vec<usize> = (0..state.center_cards.len()).collect();
+                        indices.shuffle(&mut rng);
+                        indices.iter()
+                            .take(2)
+                            .map(|&i| state.center_cards[i].clone())
+                            .collect::<Vec<_>>()
+                    };
+
+                    robot_msg = format!("机器人是预言家，查看了中心牌：{} 和 {}", cards[0], cards[1]);
+                } else {
+                    let target_id = {
+                        let state = game_state.lock().await;
+                        let candidates: Vec<usize> = state.players
+                            .keys()
+                            .filter(|&&id| id != robot.num)
+                            .copied()
+                            .collect();
+                        *candidates.choose(&mut thread_rng()).unwrap()
+                    };
+
+                    let role = {
+                        let state = game_state.lock().await;
+                        state.players.get(&target_id).unwrap().role.clone()
+                    };
+
+                    robot_msg = format!("机器人是预言家，查看了玩家 {} 的身份：{}", target_id, role);
+                }
+            }
+            "强盗" => {
+                let target_id = {
+                    let state = game_state.lock().await;
+                    let candidates: Vec<usize> = state.players
+                        .keys()
+                        .filter(|&&id| id != robot.num)
+                        .copied()
+                        .collect();
+                    *candidates.choose(&mut thread_rng()).unwrap()
+                };
+
+                let role = {
+                    let mut state = game_state.lock().await;
+                    let target_role = state.players.get(&target_id).unwrap().role.clone();
+                    let robot_role = state.robot.as_ref().unwrap().role.clone();
+                    state.players.get_mut(&target_id).unwrap().role = robot_role;
+                    state.robot.as_mut().unwrap().role = target_role.clone();
+                    target_role
+                };
+
+                robot_msg = format!("机器人是强盗，偷取了玩家 {} 的身份：{}", target_id, role);
+            }
+            "狼人" => {
+                let center_card = {
+                    let state = game_state.lock().await;
+                    state.center_cards.choose(&mut thread_rng()).unwrap().clone()
+                };
+
+                robot_msg = format!("机器人是独狼，查看了一张中心牌：{}", center_card);
+            }
+            _ => {
+                robot_msg = format!("机器人是 {}，但该角色无行动。", robot.role);
+            }
+        }
+
+        {
+            let state = game_state.lock().await;
+            if let Some(sender) = state.player_channels.get(&helper_id) {
+                let _ = sender.send(format!(
+                    "[助手专属] 机器人行动：{}",
+                    robot_msg
+                )).await;
+            }
+        }
+
+        println!("机器人行动完成：{}", robot_msg);
     }
 }
